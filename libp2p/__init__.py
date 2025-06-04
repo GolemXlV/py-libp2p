@@ -270,4 +270,7 @@ def new_host(
     return BasicHost(swarm)
 
 
-__version__ = __version("libp2p")
+try:
+    __version__ = __version("libp2p")
+except Exception:
+    __version__ = "0.0.0"
