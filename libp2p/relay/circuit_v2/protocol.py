@@ -42,13 +42,12 @@ from libp2p.tools.async_service import (
 
 from .pb.circuit_pb2 import (
     HopMessage,
-    Limit,
-    Reservation,
-)
-from .pb.circuit_pb2 import (
     StopMessage,
+    Reservation,
+    Limit,
+    Peer,
+    Status as PbStatus,
 )
-from .pb.circuit_pb2 import Status as PbStatus
 from .protocol_buffer import (
     CONNECTION_FAILED,
     INTERNAL_ERROR,
@@ -65,8 +64,9 @@ from .resources import (
 
 logger = logging.getLogger("libp2p.relay.circuit_v2")
 
-PROTOCOL_ID = TProtocol("/libp2p/circuit/relay/2.0.0")
-STOP_PROTOCOL_ID = TProtocol("/libp2p/circuit/relay/2.0.0/stop")
+# Protocol identifiers as defined by the specification
+PROTOCOL_ID = TProtocol("/libp2p/circuit/relay/0.2.0/hop")
+STOP_PROTOCOL_ID = TProtocol("/libp2p/circuit/relay/0.2.0/stop")
 
 # Default limits for relay resources
 DEFAULT_RELAY_LIMITS = RelayLimits(
@@ -438,7 +438,10 @@ class CircuitV2Protocol(Service):
                 return
 
             # Get the source stream from active relays
-            peer_id = ID(stop_msg.peer)
+            peer_id_bytes = b""
+            if stop_msg.HasField("peer") and stop_msg.peer.HasField("id"):
+                peer_id_bytes = stop_msg.peer.id
+            peer_id = ID(peer_id_bytes)
             if peer_id not in self._active_relays:
                 # Use direct attribute access to create status object for error response
                 await self._send_stop_status(
@@ -493,7 +496,10 @@ class CircuitV2Protocol(Service):
         """Handle a reservation request."""
         peer_id = None
         try:
-            peer_id = ID(msg.peer)
+            peer_id_bytes = b""
+            if msg.HasField("peer") and msg.peer.HasField("id"):
+                peer_id_bytes = msg.peer.id
+            peer_id = ID(peer_id_bytes)
             logger.debug("Handling reservation request from peer %s", peer_id)
 
             # Check if we can accept more reservations
@@ -527,7 +533,6 @@ class CircuitV2Protocol(Service):
                         expire=int(time.time() + ttl),
                         addrs=[],  # TODO: Add relay addresses
                         voucher=b"",  # We don't use vouchers yet
-                        signature=b"",  # We don't use signatures yet
                     ),
                     limit=Limit(
                         duration=self.limits.duration,
@@ -574,7 +579,10 @@ class CircuitV2Protocol(Service):
 
     async def _handle_connect(self, stream: INetStream, msg: Any) -> None:
         """Handle a connect request."""
-        peer_id = ID(msg.peer)
+        peer_id_bytes = b""
+        if msg.HasField("peer") and msg.peer.HasField("id"):
+            peer_id_bytes = msg.peer.id
+        peer_id = ID(peer_id_bytes)
         dst_stream = None
 
         # Verify reservation if provided
@@ -611,10 +619,11 @@ class CircuitV2Protocol(Service):
                 # Send STOP CONNECT message
                 stop_msg = StopMessage(
                     type=StopMessage.CONNECT,
-                    # Cast to extended interface with get_remote_peer_id
-                    peer=cast(INetStreamWithExtras, stream)
-                    .get_remote_peer_id()
-                    .to_bytes(),
+                    peer=Peer(
+                        id=cast(INetStreamWithExtras, stream)
+                        .get_remote_peer_id()
+                        .to_bytes()
+                    ),
                 )
                 await dst_stream.write(stop_msg.SerializeToString())
 
