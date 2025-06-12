@@ -1,6 +1,5 @@
 """
 Resource management for Circuit Relay v2.
-
 This module handles managing resources for relay operations,
 including reservations and connection limits.
 """
@@ -8,11 +7,9 @@ including reservations and connection limits.
 from dataclasses import (
     dataclass,
 )
+import hashlib
+import os
 import time
-from typing import (
-    TYPE_CHECKING,
-    Any,
-)
 
 from libp2p.peer.id import (
     ID,
@@ -20,10 +17,6 @@ from libp2p.peer.id import (
 
 # Import the protobuf definitions
 from .pb.circuit_pb2 import Reservation as PbReservation
-
-# Import for type checking only to avoid circular imports
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass
@@ -42,14 +35,12 @@ class Reservation:
     def __init__(self, peer_id: ID, limits: RelayLimits):
         """
         Initialize a new reservation.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID this reservation is for
         limits : RelayLimits
             The resource limits for this reservation
-
         """
         self.peer_id = peer_id
         self.limits = limits
@@ -60,10 +51,29 @@ class Reservation:
         self.voucher = self._generate_voucher()
 
     def _generate_voucher(self) -> bytes:
-        """Generate a unique voucher for this reservation."""
-        # For now, just use a simple timestamp-based voucher
-        # In production, this should be a cryptographically secure token
-        return str(int(self.created_at * 1000000)).encode()
+        """
+        Generate a unique cryptographically secure voucher for this reservation.
+        Returns
+        -------
+        bytes
+            A secure voucher token
+        """
+        # Create a random token using a combination of:
+        # - Random bytes for unpredictability
+        # - Peer ID to bind it to the specific peer
+        # - Timestamp for uniqueness
+        # - Hash everything for a fixed size output
+        random_bytes = os.urandom(16)  # 128 bits of randomness
+        timestamp = str(int(self.created_at * 1000000)).encode()
+        peer_bytes = self.peer_id.to_bytes()
+
+        # Combine all elements and hash them
+        h = hashlib.sha256()
+        h.update(random_bytes)
+        h.update(timestamp)
+        h.update(peer_bytes)
+
+        return h.digest()
 
     def is_expired(self) -> bool:
         """Check if the reservation has expired."""
@@ -79,10 +89,13 @@ class Reservation:
 
     def to_proto(self) -> PbReservation:
         """Convert the reservation to its protobuf representation."""
+        # TODO: For production use, implement proper signature generation
+        # The signature should be created by signing the voucher with the
+        # peer's private key. The current implementation with an empty signature
+        # is intended for development and testing only.
         return PbReservation(
             expire=int(self.expires_at),
             voucher=self.voucher,
-            # TODO: In production, this should be a proper signature
             signature=b"",
         )
 
@@ -90,7 +103,6 @@ class Reservation:
 class RelayResourceManager:
     """
     Manages resources and reservations for relay operations.
-
     This class handles:
     - Tracking active reservations
     - Enforcing resource limits
@@ -100,12 +112,10 @@ class RelayResourceManager:
     def __init__(self, limits: RelayLimits):
         """
         Initialize the resource manager.
-
         Parameters
         ----------
         limits : RelayLimits
             The resource limits to enforce
-
         """
         self.limits = limits
         self._reservations: dict[ID, Reservation] = {}
@@ -113,17 +123,14 @@ class RelayResourceManager:
     def can_accept_reservation(self, peer_id: ID) -> bool:
         """
         Check if a new reservation can be accepted for the given peer.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID requesting the reservation
-
         Returns
         -------
         bool
             True if the reservation can be accepted
-
         """
         # Clean expired reservations
         self._clean_expired()
@@ -139,38 +146,32 @@ class RelayResourceManager:
     def create_reservation(self, peer_id: ID) -> Reservation:
         """
         Create a new reservation for the given peer.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID to create the reservation for
-
         Returns
         -------
         Reservation
             The newly created reservation
-
         """
         reservation = Reservation(peer_id, self.limits)
         self._reservations[peer_id] = reservation
         return reservation
 
-    def verify_reservation(self, peer_id: ID, proto_res: Any) -> bool:
+    def verify_reservation(self, peer_id: ID, proto_res: PbReservation) -> bool:
         """
         Verify a reservation from a protobuf message.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID the reservation is for
-        proto_res : Any
+        proto_res : PbReservation
             The protobuf reservation message
-
         Returns
         -------
         bool
             True if the reservation is valid
-
         """
         # TODO: Implement voucher and signature verification
         reservation = self._reservations.get(peer_id)
@@ -183,17 +184,14 @@ class RelayResourceManager:
     def can_accept_connection(self, peer_id: ID) -> bool:
         """
         Check if a new connection can be accepted for the given peer.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID requesting the connection
-
         Returns
         -------
         bool
             True if the connection can be accepted
-
         """
         reservation = self._reservations.get(peer_id)
         return reservation is not None and reservation.can_accept_connection()
@@ -212,17 +210,14 @@ class RelayResourceManager:
     def reserve(self, peer_id: ID) -> int:
         """
         Create or update a reservation for a peer and return the TTL.
-
         Parameters
         ----------
         peer_id : ID
             The peer ID to reserve for
-
         Returns
         -------
         int
             The TTL of the reservation in seconds
-
         """
         # Check for existing reservation
         existing = self._reservations.get(peer_id)

@@ -1,20 +1,13 @@
 """
 Transport implementation for Circuit Relay v2.
-
 This module implements the transport layer for Circuit Relay v2,
 allowing peers to establish connections through relay nodes.
 """
 
-from collections.abc import (
-    Awaitable,
-)
+from collections.abc import Awaitable, Callable
 import logging
-from typing import (
-    Any,
-    Callable,
-    Optional,
-)
 
+import multiaddr
 import trio
 
 from libp2p.abc import (
@@ -22,8 +15,6 @@ from libp2p.abc import (
     IListener,
     INetStream,
     ITransport,
-)
-from libp2p.io.abc import (
     ReadWriteCloser,
 )
 from libp2p.network.connection.raw_connection import (
@@ -55,7 +46,7 @@ from .protocol import (
     CircuitV2Protocol,
 )
 from .protocol_buffer import (
-    OK,
+    StatusCode,
 )
 
 logger = logging.getLogger("libp2p.relay.circuit_v2.transport")
@@ -64,7 +55,6 @@ logger = logging.getLogger("libp2p.relay.circuit_v2.transport")
 class CircuitV2Transport(ITransport):
     """
     CircuitV2Transport implements the transport interface for Circuit Relay v2.
-
     This transport allows peers to establish connections through relay nodes
     when direct connections are not possible.
     """
@@ -77,7 +67,6 @@ class CircuitV2Transport(ITransport):
     ) -> None:
         """
         Initialize the Circuit v2 transport.
-
         Parameters
         ----------
         host : IHost
@@ -86,7 +75,6 @@ class CircuitV2Transport(ITransport):
             The Circuit v2 protocol instance
         config : RelayConfig
             Relay configuration
-
         """
         self.host = host
         self.protocol = protocol
@@ -101,30 +89,56 @@ class CircuitV2Transport(ITransport):
 
     async def dial(
         self,
+        maddr: multiaddr.Multiaddr,
+    ) -> RawConnection:
+        """
+        Dial a peer using the multiaddr.
+        Parameters
+        ----------
+        maddr : multiaddr.Multiaddr
+            The multiaddr to dial
+        Returns
+        -------
+        RawConnection
+            The established connection
+        Raises
+        ------
+        ConnectionError
+            If the connection cannot be established
+        """
+        # Extract peer ID from multiaddr - P_P2P code is 0x01A5 (421)
+        peer_id_str = maddr.value_for_protocol("p2p")
+        if not peer_id_str:
+            raise ConnectionError("Multiaddr does not contain peer ID")
+
+        peer_id = ID.from_base58(peer_id_str)
+        peer_info = PeerInfo(peer_id, [maddr])
+
+        # Use the internal dial_peer_info method
+        return await self.dial_peer_info(peer_info)
+
+    async def dial_peer_info(
+        self,
         peer_info: PeerInfo,
         *,
-        relay_peer_id: Optional[ID] = None,
+        relay_peer_id: ID | None = None,
     ) -> RawConnection:
         """
         Dial a peer through a relay.
-
         Parameters
         ----------
         peer_info : PeerInfo
             The peer to dial
         relay_peer_id : Optional[ID], optional
             Optional specific relay peer to use
-
         Returns
         -------
         RawConnection
             The established connection
-
         Raises
         ------
         ConnectionError
             If the connection cannot be established
-
         """
         # If no specific relay is provided, try to find one
         if relay_peer_id is None:
@@ -159,10 +173,10 @@ class CircuitV2Transport(ITransport):
             resp.ParseFromString(resp_bytes)
 
             # Access status attributes directly
-            status_code = getattr(resp.status, "code", OK)
+            status_code = getattr(resp.status, "code", StatusCode.OK)
             status_msg = getattr(resp.status, "message", "Unknown error")
 
-            if status_code != OK:
+            if status_code != StatusCode.OK:
                 raise ConnectionError(f"Relay connection failed: {status_msg}")
 
             # Create raw connection from stream
@@ -172,20 +186,17 @@ class CircuitV2Transport(ITransport):
             await relay_stream.close()
             raise ConnectionError(f"Failed to establish relay connection: {str(e)}")
 
-    async def _select_relay(self, peer_info: PeerInfo) -> Optional[ID]:
+    async def _select_relay(self, peer_info: PeerInfo) -> ID | None:
         """
         Select an appropriate relay for the given peer.
-
         Parameters
         ----------
         peer_info : PeerInfo
             The peer to connect to
-
         Returns
         -------
         Optional[ID]
             Selected relay peer ID, or None if no suitable relay found
-
         """
         # Try to find a relay
         attempts = 0
@@ -210,19 +221,16 @@ class CircuitV2Transport(ITransport):
     ) -> bool:
         """
         Make a reservation with a relay.
-
         Parameters
         ----------
         stream : INetStream
             Stream to the relay
         relay_peer_id : ID
             The relay's peer ID
-
         Returns
         -------
         bool
             True if reservation was successful
-
         """
         try:
             # Send reservation request
@@ -238,10 +246,10 @@ class CircuitV2Transport(ITransport):
             resp.ParseFromString(resp_bytes)
 
             # Access status attributes directly
-            status_code = getattr(resp.status, "code", OK)
+            status_code = getattr(resp.status, "code", StatusCode.OK)
             status_msg = getattr(resp.status, "message", "Unknown error")
 
-            if status_code != OK:
+            if status_code != StatusCode.OK:
                 logger.warning(
                     "Reservation failed with relay %s: %s",
                     relay_peer_id,
@@ -263,17 +271,14 @@ class CircuitV2Transport(ITransport):
     ) -> IListener:
         """
         Create a listener for incoming relay connections.
-
         Parameters
         ----------
         handler_function : Callable[[ReadWriteCloser], Awaitable[None]]
             The handler function for new connections
-
         Returns
         -------
         IListener
             The created listener
-
         """
         return CircuitV2Listener(self.host, self.protocol, self.config)
 
@@ -289,7 +294,6 @@ class CircuitV2Listener(Service, IListener):
     ) -> None:
         """
         Initialize the Circuit v2 listener.
-
         Parameters
         ----------
         host : IHost
@@ -298,13 +302,14 @@ class CircuitV2Listener(Service, IListener):
             The Circuit v2 protocol instance
         config : RelayConfig
             Relay configuration
-
         """
         super().__init__()
         self.host = host
         self.protocol = protocol
         self.config = config
-        self.multiaddrs: list[str] = []  # TODO: Add relay multiaddrs
+        self.multiaddrs: list[
+            multiaddr.Multiaddr
+        ] = []  # Store multiaddrs as Multiaddr objects
 
     async def handle_incoming_connection(
         self,
@@ -313,24 +318,20 @@ class CircuitV2Listener(Service, IListener):
     ) -> RawConnection:
         """
         Handle an incoming relay connection.
-
         Parameters
         ----------
         stream : INetStream
             The incoming stream
         remote_peer_id : ID
             The remote peer's ID
-
         Returns
         -------
         RawConnection
             The established connection
-
         Raises
         ------
         ConnectionError
             If the connection cannot be established
-
         """
         if not self.config.enable_stop:
             raise ConnectionError("Stop role is not enabled")
@@ -355,37 +356,36 @@ class CircuitV2Listener(Service, IListener):
         """Run the listener service."""
         # Implementation would go here
 
-    async def listen(self, maddr: Any, nursery: Any) -> bool:
+    async def listen(self, maddr: multiaddr.Multiaddr, nursery: trio.Nursery) -> bool:
         """
         Start listening on the given multiaddr.
-
         Parameters
         ----------
-        maddr : Any
+        maddr : multiaddr.Multiaddr
             The multiaddr to listen on
-        nursery : Any
+        nursery : trio.Nursery
             The nursery to run tasks in
-
         Returns
         -------
         bool
             True if listening successfully started
-
         """
-        # TODO: Implement proper multiaddr handling for relayed addresses
-        if isinstance(maddr, str):
-            self.multiaddrs.append(maddr)
+        # Convert string to Multiaddr if needed
+        addr = (
+            maddr
+            if isinstance(maddr, multiaddr.Multiaddr)
+            else multiaddr.Multiaddr(maddr)
+        )
+        self.multiaddrs.append(addr)
         return True
 
-    def get_addrs(self) -> tuple[Any, ...]:
+    def get_addrs(self) -> tuple[multiaddr.Multiaddr, ...]:
         """
         Get the listening addresses.
-
         Returns
         -------
-        tuple[Any, ...]
+        tuple[multiaddr.Multiaddr, ...]
             Tuple of listening multiaddresses
-
         """
         return tuple(self.multiaddrs)
 

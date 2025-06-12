@@ -1,22 +1,26 @@
 """Tests for the Circuit Relay v2 transport functionality."""
 
 import logging
+import time
 
 import pytest
 import trio
 
+from libp2p.custom_types import TProtocol
 from libp2p.network.stream.exceptions import (
     StreamEOF,
     StreamReset,
 )
+from libp2p.peer.id import ID
+from libp2p.peer.peerinfo import PeerInfo
 from libp2p.relay.circuit_v2.discovery import (
     RelayDiscovery,
+    RelayInfo,
 )
 from libp2p.relay.circuit_v2.protocol import (
-    DEFAULT_RELAY_LIMITS,
+    PROTOCOL_ID as RELAY_HOP_PROTOCOL_ID,
+    STOP_PROTOCOL_ID as RELAY_STOP_PROTOCOL_ID,
     CircuitV2Protocol,
-)
-from libp2p.relay.circuit_v2.resources import (
     RelayLimits,
 )
 from libp2p.relay.circuit_v2.transport import (
@@ -40,6 +44,14 @@ STREAM_TIMEOUT = 15  # seconds
 HANDLER_TIMEOUT = 15  # seconds
 SLEEP_TIME = 1.0  # seconds
 RELAY_TIMEOUT = 20  # seconds
+
+# Default limits for relay
+DEFAULT_RELAY_LIMITS = RelayLimits(
+    duration=60 * 60,  # 1 hour
+    data=1024 * 1024 * 10,  # 10 MB
+    max_circuit_conns=8,  # 8 active relay connections
+    max_reservations=4,  # 4 active reservations
+)
 
 # Message for testing
 TEST_MESSAGE = b"Hello, Circuit Relay!"
@@ -107,9 +119,9 @@ async def test_circuit_v2_transport_initialization():
         assert transport.host == host, "Host not set correctly"
         assert transport.protocol == protocol, "Protocol not set correctly"
         assert transport.config == config, "Config not set correctly"
-        assert hasattr(
-            transport, "discovery"
-        ), "Transport should have a discovery instance"
+        assert hasattr(transport, "discovery"), (
+            "Transport should have a discovery instance"
+        )
 
 
 @pytest.mark.trio
@@ -147,17 +159,20 @@ async def test_circuit_v2_transport_add_relay():
         # Replace the discovery with our manually created one
         transport.discovery = discovery
 
-        # Add relay to transport's discovery
         relay_id = relay_host.get_id()
-        discovery._add_relay = lambda peer_id: discovery._discovered_relays.update(
-            {peer_id: None}
-        )
-        discovery._discovered_relays[relay_id] = None
+        now = time.time()
+        relay_info = RelayInfo(peer_id=relay_id, discovered_at=now, last_seen=now)
+
+        async def mock_add_relay(peer_id):
+            discovery._discovered_relays[peer_id] = relay_info
+
+        discovery._add_relay = mock_add_relay  # Type ignored in test context
+        discovery._discovered_relays[relay_id] = relay_info
 
         # Verify relay was added
-        assert (
-            relay_id in discovery._discovered_relays
-        ), "Relay should be in discovery's relay list"
+        assert relay_id in discovery._discovered_relays, (
+            "Relay should be in discovery's relay list"
+        )
 
 
 @pytest.mark.trio
@@ -180,7 +195,7 @@ async def test_circuit_v2_transport_dial_through_relay():
 
         # Register test handler on target
         test_protocol = "/test/echo/1.0.0"
-        target_host.set_stream_handler(test_protocol, echo_stream_handler)
+        target_host.set_stream_handler(TProtocol(test_protocol), echo_stream_handler)
 
         # Setup transport on client
         from libp2p.relay.circuit_v2.config import (
@@ -205,6 +220,10 @@ async def test_circuit_v2_transport_dial_through_relay():
         # Replace the discovery with our manually created one
         client_transport.discovery = client_discovery
 
+        relay_protocol = CircuitV2Protocol(relay_host, allow_hop=True)
+        relay_host.set_stream_handler(RELAY_HOP_PROTOCOL_ID, relay_protocol._handle_hop_stream)
+        relay_host.set_stream_handler(RELAY_STOP_PROTOCOL_ID, relay_protocol._handle_stop_stream)
+
         # Mock the get_relay method to return our relay_host
         relay_id = relay_host.get_id()
         client_discovery.get_relay = lambda: relay_id
@@ -217,12 +236,12 @@ async def test_circuit_v2_transport_dial_through_relay():
                 logger.info("Connecting client host to relay host")
                 await connect(client_host, relay_host)
                 # Verify connection
-                assert (
-                    relay_host.get_id() in client_host.get_network().connections
-                ), "Client not connected to relay"
-                assert (
-                    client_host.get_id() in relay_host.get_network().connections
-                ), "Relay not connected to client"
+                assert relay_host.get_id() in client_host.get_network().connections, (
+                    "Client not connected to relay"
+                )
+                assert client_host.get_id() in relay_host.get_network().connections, (
+                    "Relay not connected to client"
+                )
                 logger.info("Client-Relay connection verified")
 
                 # Wait to ensure connection is fully established
@@ -231,12 +250,12 @@ async def test_circuit_v2_transport_dial_through_relay():
                 logger.info("Connecting relay host to target host")
                 await connect(relay_host, target_host)
                 # Verify connection
-                assert (
-                    target_host.get_id() in relay_host.get_network().connections
-                ), "Relay not connected to target"
-                assert (
-                    relay_host.get_id() in target_host.get_network().connections
-                ), "Target not connected to relay"
+                assert target_host.get_id() in relay_host.get_network().connections, (
+                    "Relay not connected to target"
+                )
+                assert relay_host.get_id() in target_host.get_network().connections, (
+                    "Target not connected to relay"
+                )
                 logger.info("Relay-Target connection verified")
 
                 # Wait to ensure connection is fully established
@@ -246,6 +265,8 @@ async def test_circuit_v2_transport_dial_through_relay():
         except Exception as e:
             logger.error("Failed to connect peers: %s", str(e))
             raise
+
+        await client_transport.dial_peer_info(PeerInfo(target_host.get_id(), addrs=[]), relay_peer_id=relay_id)
 
         # Test successful - the connections were established, which is enough to verify
         # that the transport can be initialized and configured correctly
@@ -270,7 +291,7 @@ async def test_circuit_v2_transport_relay_limits():
 
         # Register test handler on target
         test_protocol = "/test/echo/1.0.0"
-        target_host.set_stream_handler(test_protocol, echo_stream_handler)
+        target_host.set_stream_handler(TProtocol(test_protocol), echo_stream_handler)
 
         # Setup transports on clients
         from libp2p.relay.circuit_v2.config import (
@@ -330,23 +351,23 @@ async def test_circuit_v2_transport_relay_limits():
             raise
 
         # Verify connections
-        assert (
-            relay_host.get_id() in client1_host.get_network().connections
-        ), "Client1 not connected to relay"
-        assert (
-            relay_host.get_id() in client2_host.get_network().connections
-        ), "Client2 not connected to relay"
-        assert (
-            target_host.get_id() in relay_host.get_network().connections
-        ), "Relay not connected to target"
+        assert relay_host.get_id() in client1_host.get_network().connections, (
+            "Client1 not connected to relay"
+        )
+        assert relay_host.get_id() in client2_host.get_network().connections, (
+            "Client2 not connected to relay"
+        )
+        assert target_host.get_id() in relay_host.get_network().connections, (
+            "Relay not connected to target"
+        )
 
         # Verify the resource limits
-        assert (
-            relay_protocol.resource_manager.limits.max_circuit_conns == 1
-        ), "Wrong max_circuit_conns value"
-        assert (
-            relay_protocol.resource_manager.limits.max_reservations == 2
-        ), "Wrong max_reservations value"
+        assert relay_protocol.resource_manager.limits.max_circuit_conns == 1, (
+            "Wrong max_circuit_conns value"
+        )
+        assert relay_protocol.resource_manager.limits.max_reservations == 2, (
+            "Wrong max_reservations value"
+        )
 
         # Test successful - transports were initialized with the correct limits
         logger.info("Transport limit test successful")
