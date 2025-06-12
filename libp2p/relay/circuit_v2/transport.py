@@ -10,6 +10,7 @@ import logging
 import multiaddr
 import trio
 
+from examples.chat.chat import MAX_READ_LEN
 from libp2p.abc import (
     IHost,
     IListener,
@@ -168,7 +169,7 @@ class CircuitV2Transport(ITransport):
             await relay_stream.write(hop_msg.SerializeToString())
 
             # Read response
-            resp_bytes = await relay_stream.read()
+            resp_bytes = await relay_stream.read(MAX_READ_LEN)
             resp = HopMessage()
             resp.ParseFromString(resp_bytes)
 
@@ -241,7 +242,7 @@ class CircuitV2Transport(ITransport):
             await stream.write(reserve_msg.SerializeToString())
 
             # Read response
-            resp_bytes = await stream.read()
+            resp_bytes = await stream.read(MAX_READ_LEN)
             resp = HopMessage()
             resp.ParseFromString(resp_bytes)
 
@@ -338,7 +339,7 @@ class CircuitV2Listener(Service, IListener):
 
         try:
             # Read STOP message
-            msg_bytes = await stream.read()
+            msg_bytes = await stream.read(MAX_READ_LEN)
             stop_msg = StopMessage()
             stop_msg.ParseFromString(msg_bytes)
 
