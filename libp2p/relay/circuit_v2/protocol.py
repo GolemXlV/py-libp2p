@@ -537,24 +537,22 @@ class CircuitV2Protocol(Service):
 
         except Exception as e:
             logger.error("Error handling reservation request: %s", str(e))
-            if cast(INetStreamWithExtras, stream).is_open():
-                try:
-                    # Send error response
-                    await self._send_status(
-                        stream,
-                        StatusCode.INTERNAL_ERROR,
-                        f"Failed to process reservation: {str(e)}",
-                    )
-                except Exception as send_err:
-                    logger.error("Failed to send error response: %s", str(send_err))
+            try:
+                # Send error response
+                await self._send_status(
+                    stream,
+                    StatusCode.INTERNAL_ERROR,
+                    f"Failed to process reservation: {str(e)}",
+                )
+            except Exception as send_err:
+                logger.error("Failed to send error response: %s", str(send_err))
         finally:
             # Always close the stream when done with reservation
-            if cast(INetStreamWithExtras, stream).is_open():
-                try:
-                    with trio.fail_after(STREAM_CLOSE_TIMEOUT):
-                        await stream.close()
-                except Exception as close_err:
-                    logger.error("Error closing stream: %s", str(close_err))
+            try:
+                with trio.fail_after(STREAM_CLOSE_TIMEOUT):
+                    await stream.close()
+            except Exception as close_err:
+                logger.error("Error closing stream: %s", str(close_err))
 
     async def _handle_connect(self, stream: INetStream, msg: Any) -> None:
         """Handle a connect request."""
