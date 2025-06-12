@@ -490,7 +490,7 @@ class CircuitV2Protocol(Service):
 
                 status_msg = HopMessage(
                     type=HopMessage.STATUS,
-                    status=status.to_pb(),
+                    status=status,
                 )
                 await stream.write(status_msg.SerializeToString())
                 return
@@ -507,7 +507,7 @@ class CircuitV2Protocol(Service):
 
                 response = HopMessage(
                     type=HopMessage.STATUS,
-                    status=status.to_pb(),
+                    status=status,
                     reservation=Reservation(
                         expire=int(time.time() + ttl),
                         voucher=b"",  # We don't use vouchers yet
