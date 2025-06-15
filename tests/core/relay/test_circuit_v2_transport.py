@@ -7,11 +7,12 @@ import pytest
 import trio
 
 from libp2p.custom_types import TProtocol
+from libp2p.network.exceptions import SwarmException
 from libp2p.network.stream.exceptions import (
     StreamEOF,
     StreamReset,
 )
-from libp2p.peer.id import ID
+from libp2p.stream_muxer.yamux.yamux import PROTOCOL_ID as YAMUX_PROTOCOL_ID
 from libp2p.peer.peerinfo import PeerInfo
 from libp2p.relay.circuit_v2.discovery import (
     RelayDiscovery,
@@ -26,12 +27,15 @@ from libp2p.relay.circuit_v2.protocol import (
 from libp2p.relay.circuit_v2.transport import (
     CircuitV2Transport,
 )
+from libp2p.security.insecure.transport import InsecureSession
+from libp2p.stream_muxer.yamux.yamux import Yamux
 from libp2p.tools.constants import (
     MAX_READ_LEN,
 )
 from libp2p.tools.utils import (
     connect,
 )
+from libp2p.transport.exceptions import MuxerUpgradeFailure, SecurityUpgradeFailure
 from tests.utils.factories import (
     HostFactory,
 )
@@ -181,29 +185,60 @@ async def test_circuit_v2_transport_dial_through_relay():
     async with HostFactory.create_batch_and_listen(3) as hosts:
         client_host, relay_host, target_host = hosts
         logger.info("Created hosts for test_circuit_v2_transport_dial_through_relay")
-        logger.info("Client host ID: %s", client_host.get_id())
-        logger.info("Relay host ID: %s", relay_host.get_id())
-        logger.info("Target host ID: %s", target_host.get_id())
-
-        # Setup relay with Circuit v2 protocol
-        limits = RelayLimits(
-            duration=DEFAULT_RELAY_LIMITS.duration,
-            data=DEFAULT_RELAY_LIMITS.data,
-            max_circuit_conns=DEFAULT_RELAY_LIMITS.max_circuit_conns,
-            max_reservations=DEFAULT_RELAY_LIMITS.max_reservations,
-        )
-
-        # Register test handler on target
-        test_protocol = "/test/echo/1.0.0"
-        target_host.set_stream_handler(TProtocol(test_protocol), echo_stream_handler)
+        logger.info("Client host ID: %s", client_id := client_host.get_id())
+        logger.info("Relay host ID: %s", relay_id := relay_host.get_id())
+        logger.info("Target host ID: %s", target_id := target_host.get_id())
 
         # Setup transport on client
         from libp2p.relay.circuit_v2.config import (
             RelayConfig,
         )
 
-        client_config = RelayConfig()
-        client_protocol = CircuitV2Protocol(client_host, limits, allow_hop=False)
+        # fix a discovery
+        now = time.time()
+        relay_info = RelayInfo(peer_id=relay_id, discovered_at=now, last_seen=now)
+
+        relay_config = RelayConfig(enable_hop=True, enable_stop=True)
+        relay_protocol = CircuitV2Protocol(relay_host, limits=relay_config.limits, allow_hop=True)
+        relay_host.set_stream_handler(RELAY_HOP_PROTOCOL_ID, relay_protocol._handle_hop_stream)
+        relay_host.set_stream_handler(RELAY_STOP_PROTOCOL_ID, relay_protocol._handle_stop_stream)
+        relay_transport = CircuitV2Transport(relay_host, relay_protocol, relay_config)
+
+        target_config = RelayConfig(
+            enable_stop=True,  # accept relayed conn
+            enable_client=True,  # use relays for outbound conn
+        )
+
+        # Create a discovery instance
+        target_discovery = RelayDiscovery(
+            host=target_host,
+            auto_reserve=False,
+            discovery_interval=target_config.discovery_interval,
+            max_relays=target_config.max_relays,
+        )
+
+        # Register test handler on target
+        test_protocol = "/test/echo/1.0.0"
+        target_host.set_stream_handler(TProtocol(test_protocol), echo_stream_handler)
+
+        target_protocol = CircuitV2Protocol(target_host, allow_hop=False)
+        target_host.set_stream_handler(RELAY_STOP_PROTOCOL_ID, target_protocol._handle_stop_stream)
+        target_transport = CircuitV2Transport(target_host, target_protocol, target_config)
+
+        target_listener = target_transport.create_listener(echo_stream_handler)
+        await target_listener.listen("/p2p-circuit", None)  # type: ignore
+
+        async def mock_add_relay(peer_id):
+            target_discovery._discovered_relays[peer_id] = relay_info
+
+        target_discovery._add_relay = mock_add_relay  # Type ignored in test context
+        target_discovery._discovered_relays[relay_id] = relay_info
+
+
+        client_config = RelayConfig(
+            enable_client=True,
+        )
+        client_protocol = CircuitV2Protocol(client_host, limits=client_config.limits, allow_hop=False)
 
         # Create a discovery instance
         client_discovery = RelayDiscovery(
@@ -220,13 +255,15 @@ async def test_circuit_v2_transport_dial_through_relay():
         # Replace the discovery with our manually created one
         client_transport.discovery = client_discovery
 
-        relay_protocol = CircuitV2Protocol(relay_host, allow_hop=True)
-        relay_host.set_stream_handler(RELAY_HOP_PROTOCOL_ID, relay_protocol._handle_hop_stream)
-        relay_host.set_stream_handler(RELAY_STOP_PROTOCOL_ID, relay_protocol._handle_stop_stream)
-
         # Mock the get_relay method to return our relay_host
         relay_id = relay_host.get_id()
         client_discovery.get_relay = lambda: relay_id
+
+        async def mock_add_relay(peer_id):
+            client_discovery._discovered_relays[peer_id] = relay_info
+
+        client_discovery._add_relay = mock_add_relay  # Type ignored in test context
+        client_discovery._discovered_relays[relay_id] = relay_info
 
         # Connect client to relay and relay to target
         try:
@@ -247,8 +284,8 @@ async def test_circuit_v2_transport_dial_through_relay():
                 # Wait to ensure connection is fully established
                 await trio.sleep(SLEEP_TIME)
 
-                logger.info("Connecting relay host to target host")
-                await connect(relay_host, target_host)
+                logger.info("Connecting target host to relay host")
+                await connect(target_host, relay_host)
                 # Verify connection
                 assert target_host.get_id() in relay_host.get_network().connections, (
                     "Relay not connected to target"
@@ -266,7 +303,55 @@ async def test_circuit_v2_transport_dial_through_relay():
             logger.error("Failed to connect peers: %s", str(e))
             raise
 
-        await client_transport.dial_peer_info(PeerInfo(target_host.get_id(), addrs=[]), relay_peer_id=relay_id)
+        # make a reservation for target
+        await target_discovery.make_reservation(relay_id)
+
+        raw_conn = await client_transport.dial_peer_info(PeerInfo(target_host.get_id(), addrs=[]), relay_peer_id=relay_id)
+        assert raw_conn is not None
+
+        # Per, https://discuss.libp2p.io/t/multistream-security/130, we first secure
+        # # the conn and then mux the conn
+        # try:
+        #     secured_conn = await client_host._network.upgrader.upgrade_security(raw_conn, target_id, True)  # type: ignore
+        # except SecurityUpgradeFailure as error:
+        #     logger.debug("failed to upgrade security for peer %s", target_id)
+        #     await raw_conn.close()
+        #     raise SwarmException(
+        #         f"failed to upgrade security for peer {target_id}"
+        #     ) from error
+
+        # logger.debug("upgraded security for peer %s", target_id)
+
+        # try:
+        #     muxed_conn = await client_host._network.upgrader.upgrade_connection(secured_conn, target_id)  # type: ignore
+        # except MuxerUpgradeFailure as error:
+        #     logger.debug("failed to upgrade mux for peer %s", target_id)
+        #     await secured_conn.close()
+        #     raise SwarmException(f"failed to upgrade mux for peer {target_id}") from error
+
+        # secured_conn = InsecureSession(
+        #     local_peer=client_id,
+        #     local_private_key=client_host.get_private_key(),
+        #     remote_peer=target_id,
+        #     remote_permanent_pubkey=target_host.get_public_key(),
+        #     is_initiator=raw_conn.is_initiator,
+        #     conn=raw_conn,
+        # )
+        # logger.debug("upgraded security for peer %s", target_id)
+
+        # muxed_conn = client_host._network.upgrader.muxer_multistream.transports[YAMUX_PROTOCOL_ID](secured_conn, target_id)  # type: ignore
+
+        # swarm_conn = await client_host._network.add_conn(muxed_conn)  # type: ignore
+        # stream = await swarm_conn.new_stream()
+        # stream.set_protocol(test_protocol)
+
+        # message = "Hello from source, message"
+        # print(f"Sending: {message}")
+
+        # await stream.write(message.encode('utf-8'))
+        # response = await stream.read(1024)
+
+        logger.debug("successfully dialed peer %s", target_id)
 
         # Test successful - the connections were established, which is enough to verify
         # that the transport can be initialized and configured correctly

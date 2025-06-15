@@ -15,7 +15,6 @@ from typing import (
 
 import trio
 
-from examples.chat.chat import MAX_READ_LEN
 from libp2p.abc import (
     IHost,
     INetStream,
@@ -26,6 +25,7 @@ from libp2p.custom_types import (
 from libp2p.io.abc import (
     ReadWriteCloser,
 )
+from libp2p.io.exceptions import IOException
 from libp2p.peer.id import (
     ID,
 )
@@ -36,6 +36,7 @@ from libp2p.stream_muxer.mplex.exceptions import (
 from libp2p.tools.async_service import (
     Service,
 )
+from libp2p.tools.constants import MAX_READ_LEN
 
 from .pb.circuit_pb2 import (
     HopMessage,
@@ -420,37 +421,11 @@ class CircuitV2Protocol(Service):
                 await self._close_stream(stream)
                 return
 
-            # Get the source stream from active relays
-            peer_id = ID(stop_msg.peer)
-            if peer_id not in self._active_relays:
-                # Use direct attribute access to create status object for error response
-                await self._send_stop_status(
-                    stream,
-                    StatusCode.CONNECTION_FAILED,
-                    "No pending relay connection",
-                )
-                await self._close_stream(stream)
-                return
-
-            src_stream, _ = self._active_relays[peer_id]
-            self._active_relays[peer_id] = (src_stream, stream)
-
-            # Send success status to both sides
-            await self._send_status(
-                src_stream,
-                StatusCode.OK,
-                "Connection established",
-            )
             await self._send_stop_status(
                 stream,
                 StatusCode.OK,
                 "Connection established",
             )
-
-            # Start relaying data
-            async with trio.open_nursery() as nursery:
-                nursery.start_soon(self._relay_data, src_stream, stream, peer_id)
-                nursery.start_soon(self._relay_data, stream, src_stream, peer_id)
 
         except trio.TooSlowError:
             logger.error("Timeout reading from stop stream")
@@ -582,7 +557,7 @@ class CircuitV2Protocol(Service):
 
         try:
             # Store the source stream with properly typed None
-            self._active_relays[peer_id] = (stream, None)
+            self._active_relays[stream.muxed_conn.peer_id] = (stream, None) # type: ignore
 
             # Try to connect to the destination with timeout
             with trio.fail_after(STREAM_READ_TIMEOUT):
@@ -594,11 +569,11 @@ class CircuitV2Protocol(Service):
                 stop_msg = StopMessage(
                     type=StopMessage.CONNECT,
                     # Cast to extended interface with get_remote_peer_id
-                    peer=cast(INetStreamWithExtras, stream)
-                    .get_remote_peer_id()
+                    peer=stream.muxed_conn.peer_id
                     .to_bytes(),
                 )
                 await dst_stream.write(stop_msg.SerializeToString())
+                self._active_relays[dst_stream.muxed_conn.peer_id] = (dst_stream, None) # type: ignore
 
                 # Wait for response from destination
                 resp_bytes = await dst_stream.read(MAX_READ_LEN)
@@ -621,7 +596,8 @@ class CircuitV2Protocol(Service):
                     )
 
             # Update active relays with destination stream
-            self._active_relays[peer_id] = (stream, dst_stream)
+            self._active_relays[stream.muxed_conn.peer_id] = (stream, dst_stream)
+            self._active_relays[dst_stream.muxed_conn.peer_id] = (dst_stream, stream)
 
             # Update reservation connection count
             reservation = self.resource_manager._reservations.get(peer_id)
@@ -637,8 +613,8 @@ class CircuitV2Protocol(Service):
 
             # Start relaying data
             async with trio.open_nursery() as nursery:
-                nursery.start_soon(self._relay_data, stream, dst_stream, peer_id)
-                nursery.start_soon(self._relay_data, dst_stream, stream, peer_id)
+                nursery.start_soon(self._relay_data, stream, dst_stream, stream.muxed_conn.peer_id)
+                nursery.start_soon(self._relay_data, dst_stream, stream, dst_stream.muxed_conn.peer_id)
 
         except (trio.TooSlowError, ConnectionError) as e:
             logger.error("Error establishing relay connection: %s", str(e))
@@ -654,7 +630,7 @@ class CircuitV2Protocol(Service):
             if reservation:
                 reservation.active_connections -= 1
             await stream.reset()
-            if dst_stream and not cast(INetStreamWithExtras, dst_stream).is_closed():
+            if dst_stream:
                 await dst_stream.reset()
         except Exception as e:
             logger.error("Unexpected error in connect handler: %s", str(e))
@@ -666,7 +642,7 @@ class CircuitV2Protocol(Service):
             if peer_id in self._active_relays:
                 del self._active_relays[peer_id]
             await stream.reset()
-            if dst_stream and not cast(INetStreamWithExtras, dst_stream).is_closed():
+            if dst_stream:
                 await dst_stream.reset()
 
     async def _relay_data(

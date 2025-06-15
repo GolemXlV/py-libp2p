@@ -10,7 +10,6 @@ import logging
 import multiaddr
 import trio
 
-from examples.chat.chat import MAX_READ_LEN
 from libp2p.abc import (
     IHost,
     IListener,
@@ -30,6 +29,7 @@ from libp2p.peer.peerinfo import (
 from libp2p.tools.async_service import (
     Service,
 )
+from libp2p.tools.constants import MAX_READ_LEN
 
 from .config import (
     ClientConfig,
@@ -153,13 +153,16 @@ class CircuitV2Transport(ITransport):
             raise ConnectionError(f"Could not open stream to relay {relay_peer_id}")
 
         try:
-            # First try to make a reservation if enabled
-            if self.config.enable_client:
-                success = await self._make_reservation(relay_stream, relay_peer_id)
-                if not success:
-                    logger.warning(
-                        "Failed to make reservation with relay %s", relay_peer_id
-                    )
+            # # First try to make a reservation if enabled
+            # if self.config.enable_client:
+            #     success = await self._make_reservation(relay_stream, relay_peer_id)
+            #     if not success:
+            #         logger.warning(
+            #             "Failed to make reservation with relay %s", relay_peer_id
+            #         )
+            # relay_stream = await self.host.new_stream(relay_peer_id, [PROTOCOL_ID])
+            # if not relay_stream:
+            #     raise ConnectionError(f"Could not open stream to relay {relay_peer_id}")
 
             # Send HOP CONNECT message
             hop_msg = HopMessage(
